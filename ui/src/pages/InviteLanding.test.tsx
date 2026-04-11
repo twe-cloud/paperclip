@@ -85,7 +85,7 @@ describe("InviteLandingPage", () => {
       id: "invite-1",
       companyId: "company-1",
       companyName: "Acme Robotics",
-      companyLogoUrl: "/api/assets/logo-1/content",
+      companyLogoUrl: "/api/invites/pcp_invite_test/logo",
       companyBrandColor: "#114488",
       inviteType: "company_join",
       allowedJoinTypes: "both",
@@ -143,9 +143,11 @@ describe("InviteLandingPage", () => {
     await flushReact();
 
     expect(container.textContent).toContain("Join Acme Robotics");
-    expect(container.textContent).toContain("Personal access");
+    expect(container.textContent).toContain("Sign in");
     expect(container.textContent).toContain("Create account");
     expect(container.textContent).not.toContain("Join as human");
+    expect(container.textContent).not.toContain("How personal access works");
+    expect(container.textContent).not.toContain("Choose your path");
     expect(container.querySelector('[data-testid="invite-inline-auth"]')).not.toBeNull();
     expect(localStorage.getItem("paperclip:pending-invite-token")).toBe("pcp_invite_test");
     expect(container.querySelector('img[alt="Acme Robotics logo"]')).not.toBeNull();
@@ -166,7 +168,7 @@ describe("InviteLandingPage", () => {
       passwordInput!.dispatchEvent(new Event("change", { bubbles: true }));
     });
 
-    const authForm = container.querySelector('[data-testid="invite-inline-auth"] form') as HTMLFormElement | null;
+    const authForm = container.querySelector('[data-testid="invite-inline-auth"]') as HTMLFormElement | null;
     expect(authForm).not.toBeNull();
 
     await act(async () => {
@@ -182,6 +184,42 @@ describe("InviteLandingPage", () => {
     });
     expect(getSessionMock).toHaveBeenCalled();
     expect(localStorage.getItem("paperclip:pending-invite-token")).toBe("pcp_invite_test");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("falls back to the generated company icon when the invite logo fails to load", async () => {
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <MemoryRouter initialEntries={["/invite/pcp_invite_test"]}>
+          <QueryClientProvider client={queryClient}>
+            <Routes>
+              <Route path="/invite/:token" element={<InviteLandingPage />} />
+            </Routes>
+          </QueryClientProvider>
+        </MemoryRouter>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    const logo = container.querySelector('img[alt="Acme Robotics logo"]') as HTMLImageElement | null;
+    expect(logo).not.toBeNull();
+
+    await act(async () => {
+      logo?.dispatchEvent(new Event("error"));
+    });
+    await flushReact();
+
+    expect(container.querySelector('img[alt="Acme Robotics logo"]')).toBeNull();
+    expect(container.querySelector('img[aria-hidden="true"]')).not.toBeNull();
 
     await act(async () => {
       root.unmount();

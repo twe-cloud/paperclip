@@ -34,6 +34,9 @@ const mockBoardAuthService = vi.hoisted(() => ({
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
+const mockStorage = vi.hoisted(() => ({
+  headObject: vi.fn(),
+}));
 
 vi.mock("../services/index.js", () => ({
   accessService: () => mockAccessService,
@@ -42,6 +45,10 @@ vi.mock("../services/index.js", () => ({
   deduplicateAgentName: vi.fn(),
   logActivity: mockLogActivity,
   notifyHireApproved: vi.fn(),
+}));
+
+vi.mock("../storage/index.js", () => ({
+  getStorageService: () => mockStorage,
 }));
 
 function createDbStub() {
@@ -81,6 +88,15 @@ function createDbStub() {
         where: vi.fn().mockImplementation(() => {
           if (isInvitesTable(table)) {
             return Promise.resolve([createdInvite]);
+          }
+          if (selection && typeof selection === "object" && "objectKey" in selection) {
+            return Promise.resolve([{
+              companyId: "company-1",
+              objectKey: "company-1/assets/companies/logo-1",
+              contentType: "image/png",
+              byteSize: 3,
+              originalFilename: "logo.png",
+            }]);
           }
           if (
             (selection && typeof selection === "object" && "name" in selection) ||
@@ -131,6 +147,7 @@ describe("POST /companies/:companyId/openclaw/invite-prompt", () => {
     mockAccessService.canUser.mockResolvedValue(false);
     mockAgentService.getById.mockReset();
     mockLogActivity.mockResolvedValue(undefined);
+    mockStorage.headObject.mockResolvedValue({ exists: true, contentLength: 3, contentType: "image/png" });
   });
 
   it("rejects non-CEO agent callers", async () => {
@@ -209,7 +226,7 @@ describe("POST /companies/:companyId/openclaw/invite-prompt", () => {
     expect(res.status).toBe(200);
     expect(res.body.companyName).toBe("Acme AI");
     expect(res.body.companyBrandColor).toBe("#225577");
-    expect(res.body.companyLogoUrl).toBe("/api/assets/logo-1/content");
+    expect(res.body.companyLogoUrl).toBe("/api/invites/pcp_invite_test/logo");
     expect(res.body.inviteType).toBe("company_join");
     expect(res.body.allowedJoinTypes).toBe("agent");
   });

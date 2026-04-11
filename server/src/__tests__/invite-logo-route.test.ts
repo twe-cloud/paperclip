@@ -1,8 +1,10 @@
+import { Readable } from "node:stream";
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockStorage = vi.hoisted(() => ({
+  getObject: vi.fn(),
   headObject: vi.fn(),
 }));
 
@@ -29,14 +31,14 @@ function createSelectChain(rows: unknown[]) {
   };
 }
 
-function createDbStub(inviteRows: unknown[], companyRows: unknown[], logoRows: unknown[]) {
+function createDbStub(inviteRows: unknown[], companyRows: unknown[]) {
   let selectCall = 0;
   return {
     select() {
       selectCall += 1;
-      if (selectCall === 1) return createSelectChain(inviteRows);
-      if (selectCall === 2) return createSelectChain(companyRows);
-      return createSelectChain(logoRows);
+      return selectCall === 1
+        ? createSelectChain(inviteRows)
+        : createSelectChain(companyRows);
     },
   };
 }
@@ -60,13 +62,13 @@ function createApp(db: Record<string, unknown>) {
   return app;
 }
 
-describe("GET /invites/:token", () => {
+describe("GET /invites/:token/logo", () => {
   beforeEach(() => {
+    mockStorage.getObject.mockReset();
     mockStorage.headObject.mockReset();
-    mockStorage.headObject.mockResolvedValue({ exists: true, contentLength: 3, contentType: "image/png" });
   });
 
-  it("returns company branding in the invite summary response", async () => {
+  it("serves the company logo for an active invite without company auth", async () => {
     const invite = {
       id: "invite-1",
       companyId: "company-1",
@@ -81,72 +83,64 @@ describe("GET /invites/:token", () => {
       createdAt: new Date("2026-03-07T00:00:00.000Z"),
       updatedAt: new Date("2026-03-07T00:00:00.000Z"),
     };
+    mockStorage.headObject.mockResolvedValue({
+      exists: true,
+      contentType: "image/png",
+      contentLength: 3,
+    });
+    mockStorage.getObject.mockResolvedValue({
+      contentType: "image/png",
+      contentLength: 3,
+      stream: Readable.from([Buffer.from("png")]),
+    });
     const app = createApp(
-      createDbStub(
-        [invite],
-        [{
-          name: "Acme Robotics",
-          brandColor: "#114488",
-          logoAssetId: "logo-1",
-        }],
-        [{
-          companyId: "company-1",
-          objectKey: "company-1/assets/companies/logo-1",
-          contentType: "image/png",
-          byteSize: 3,
-          originalFilename: "logo.png",
-        }],
-      ),
+      createDbStub([invite], [{
+        companyId: "company-1",
+        objectKey: "assets/companies/logo-1",
+        contentType: "image/png",
+        byteSize: 3,
+        originalFilename: "logo.png",
+      }]),
     );
 
-    const res = await request(app).get("/api/invites/pcp_invite_test");
+    const res = await request(app).get("/api/invites/pcp_invite_test/logo");
 
     expect(res.status).toBe(200);
-    expect(res.body.companyId).toBe("company-1");
-    expect(res.body.companyName).toBe("Acme Robotics");
-    expect(res.body.companyBrandColor).toBe("#114488");
-    expect(res.body.companyLogoUrl).toBe("/api/invites/pcp_invite_test/logo");
-    expect(res.body.inviteType).toBe("company_join");
+    expect(res.headers["content-type"]).toContain("image/png");
+    expect(mockStorage.headObject).toHaveBeenCalledWith("company-1", "assets/companies/logo-1");
+    expect(mockStorage.getObject).toHaveBeenCalledWith("company-1", "assets/companies/logo-1");
   });
 
-  it("omits companyLogoUrl when the stored logo object is missing", async () => {
+  it("returns 404 when the logo asset record exists but storage does not", async () => {
+    const invite = {
+      id: "invite-1",
+      companyId: "company-1",
+      inviteType: "company_join",
+      allowedJoinTypes: "human",
+      tokenHash: "hash",
+      defaultsPayload: null,
+      expiresAt: new Date("2027-03-07T00:10:00.000Z"),
+      invitedByUserId: null,
+      revokedAt: null,
+      acceptedAt: null,
+      createdAt: new Date("2026-03-07T00:00:00.000Z"),
+      updatedAt: new Date("2026-03-07T00:00:00.000Z"),
+    };
     mockStorage.headObject.mockResolvedValue({ exists: false });
-
-    const invite = {
-      id: "invite-1",
-      companyId: "company-1",
-      inviteType: "company_join",
-      allowedJoinTypes: "human",
-      tokenHash: "hash",
-      defaultsPayload: null,
-      expiresAt: new Date("2027-03-07T00:10:00.000Z"),
-      invitedByUserId: null,
-      revokedAt: null,
-      acceptedAt: null,
-      createdAt: new Date("2026-03-07T00:00:00.000Z"),
-      updatedAt: new Date("2026-03-07T00:00:00.000Z"),
-    };
     const app = createApp(
-      createDbStub(
-        [invite],
-        [{
-          name: "Acme Robotics",
-          brandColor: "#114488",
-          logoAssetId: "logo-1",
-        }],
-        [{
-          companyId: "company-1",
-          objectKey: "company-1/assets/companies/logo-1",
-          contentType: "image/png",
-          byteSize: 3,
-          originalFilename: "logo.png",
-        }],
-      ),
+      createDbStub([invite], [{
+        companyId: "company-1",
+        objectKey: "assets/companies/logo-1",
+        contentType: "image/png",
+        byteSize: 3,
+        originalFilename: "logo.png",
+      }]),
     );
 
-    const res = await request(app).get("/api/invites/pcp_invite_test");
+    const res = await request(app).get("/api/invites/pcp_invite_test/logo");
 
-    expect(res.status).toBe(200);
-    expect(res.body.companyLogoUrl).toBeNull();
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("Invite logo not found");
+    expect(mockStorage.getObject).not.toHaveBeenCalled();
   });
 });
