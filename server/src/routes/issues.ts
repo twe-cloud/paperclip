@@ -1739,6 +1739,10 @@ export function issueRoutes(
       existing.status === "backlog" &&
       issue.status !== "backlog" &&
       req.body.status !== undefined;
+    const statusChangedFromBlockedToTodo =
+      existing.status === "blocked" &&
+      issue.status === "todo" &&
+      req.body.status !== undefined;
     const previousExecutionState = parseIssueExecutionState(existing.executionState);
     const nextExecutionState = parseIssueExecutionState(issue.executionState);
     const executionStageWakeup = buildExecutionStageWakeup({
@@ -1792,7 +1796,7 @@ export function issueRoutes(
         });
       }
 
-      if (!assigneeChanged && statusChangedFromBacklog && issue.assigneeAgentId) {
+      if (!assigneeChanged && (statusChangedFromBacklog || statusChangedFromBlockedToTodo) && issue.assigneeAgentId) {
         addWakeup(issue.assigneeAgentId, {
           source: "automation",
           triggerDetail: "system",
