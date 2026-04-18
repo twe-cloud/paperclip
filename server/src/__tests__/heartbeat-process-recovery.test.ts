@@ -997,6 +997,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.executionRunId).toBeNull();
   });
 
+<<<<<<< HEAD
   it("classifies actionable plan-only recovery and enqueues one liveness continuation", async () => {
     mockAdapterExecute.mockResolvedValueOnce({
       exitCode: 0,
