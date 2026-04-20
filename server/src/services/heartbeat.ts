@@ -630,7 +630,6 @@ const heartbeatRunIssueSummaryColumns = {
 function appendExcerpt(prev: string, chunk: string) {
   return appendWithByteCap(prev, chunk, MAX_EXCERPT_BYTES);
 }
-}
 
 function truncateRunEventString(value: string) {
   if (value.length <= MAX_RUN_EVENT_PAYLOAD_STRING_CHARS) return value;

@@ -1421,10 +1421,6 @@ export async function runChildProcess(
               maybeArmTerminalResultCleanup();
               resumeReadable(readable);
             });
-            .finally(() => {
-              maybeArmTerminalResultCleanup();
-              resumeReadable(readable);
-            });
         });
 
         child.stderr?.on("data", (chunk: unknown) => {
@@ -1437,10 +1433,6 @@ export async function runChildProcess(
           logChain = logChain
             .then(() => opts.onLog("stderr", text))
             .catch((err) => onLogError(err, runId, "failed to append stderr log chunk"))
-            .finally(() => {
-              maybeArmTerminalResultCleanup();
-              resumeReadable(readable);
-            });
             .finally(() => {
               maybeArmTerminalResultCleanup();
               resumeReadable(readable);
