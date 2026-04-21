@@ -4,8 +4,11 @@ import {
   agents,
   companies,
   createDb,
+  documentRevisions,
+  documents,
   goals,
   heartbeatRuns,
+  issueDocuments,
   instanceSettings,
   issueRelations,
   issueThreadInteractions,
@@ -37,6 +40,9 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
 
   afterEach(async () => {
     await db.delete(issueThreadInteractions);
+    await db.delete(issueDocuments);
+    await db.delete(documentRevisions);
+    await db.delete(documents);
     await db.delete(issueRelations);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
@@ -486,5 +492,256 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     const rows = await db.select().from(issueThreadInteractions);
     expect(rows).toHaveLength(1);
     expect(rows[0]?.idempotencyKey).toBe("run-1:questionnaire");
+  });
+
+  it("accepts request_confirmation interactions without creating child issues", async () => {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title: "Confirm a request",
+      level: "task",
+      status: "active",
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      goalId,
+      title: "Parent issue",
+      status: "in_progress",
+      priority: "medium",
+    });
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        prompt: "Apply this plan?",
+        acceptLabel: "Apply",
+        rejectLabel: "Keep editing",
+        detailsMarkdown: "Creates follow-up work after acceptance.",
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    expect(created.kind).toBe("request_confirmation");
+    expect(created.status).toBe("pending");
+
+    const accepted = await interactionsSvc.acceptInteraction({
+      id: issueId,
+      companyId,
+      goalId,
+      projectId: null,
+    }, created.id, {}, {
+      userId: "local-board",
+    });
+
+    expect(accepted.createdIssues).toEqual([]);
+    expect(accepted.interaction).toMatchObject({
+      kind: "request_confirmation",
+      status: "accepted",
+      result: {
+        version: 1,
+        outcome: "accepted",
+      },
+      resolvedByUserId: "local-board",
+    });
+  });
+
+  it("expires supersedable request confirmations when a user comments", async () => {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+    const commentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title: "Comment supersede",
+      level: "task",
+      status: "active",
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      goalId,
+      title: "Parent issue",
+      status: "in_progress",
+      priority: "medium",
+    });
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "Proceed with the current draft?",
+        supersedeOnUserComment: true,
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    const expired = await interactionsSvc.expireRequestConfirmationsSupersededByComment({
+      id: issueId,
+      companyId,
+    }, {
+      id: commentId,
+      authorUserId: "local-board",
+    }, {
+      userId: "local-board",
+    });
+
+    expect(expired).toHaveLength(1);
+    expect(expired[0]).toMatchObject({
+      id: created.id,
+      status: "expired",
+      result: {
+        version: 1,
+        outcome: "superseded_by_comment",
+        commentId,
+      },
+      resolvedByUserId: "local-board",
+    });
+  });
+
+  it("expires request confirmations when the watched issue document revision changes", async () => {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+    const documentId = randomUUID();
+    const revisionId = randomUUID();
+    const nextRevisionId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title: "Document target confirmation",
+      level: "task",
+      status: "active",
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      goalId,
+      title: "Parent issue",
+      status: "in_progress",
+      priority: "medium",
+    });
+    await db.insert(documents).values({
+      id: documentId,
+      companyId,
+      title: "Plan",
+      format: "markdown",
+      latestBody: "v1",
+      latestRevisionId: revisionId,
+      latestRevisionNumber: 1,
+    });
+    await db.insert(issueDocuments).values({
+      companyId,
+      issueId,
+      documentId,
+      key: "plan",
+    });
+    await db.insert(documentRevisions).values({
+      id: revisionId,
+      companyId,
+      documentId,
+      revisionNumber: 1,
+      title: "Plan",
+      format: "markdown",
+      body: "v1",
+    });
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        prompt: "Apply the plan document?",
+        target: {
+          type: "issue_document",
+          issueId,
+          documentId,
+          key: "plan",
+          revisionId,
+          revisionNumber: 1,
+        },
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    await db.insert(documentRevisions).values({
+      id: nextRevisionId,
+      companyId,
+      documentId,
+      revisionNumber: 2,
+      title: "Plan",
+      format: "markdown",
+      body: "v2",
+    });
+    await db.update(documents).set({
+      latestBody: "v2",
+      latestRevisionId: nextRevisionId,
+      latestRevisionNumber: 2,
+    });
+
+    const accepted = await interactionsSvc.acceptInteraction({
+      id: issueId,
+      companyId,
+      goalId,
+      projectId: null,
+    }, created.id, {}, {
+      userId: "local-board",
+    });
+
+    expect(accepted.interaction).toMatchObject({
+      id: created.id,
+      status: "expired",
+      result: {
+        version: 1,
+        outcome: "stale_target",
+        staleTarget: {
+          type: "issue_document",
+          key: "plan",
+          revisionId,
+        },
+      },
+    });
   });
 });

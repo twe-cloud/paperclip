@@ -192,6 +192,13 @@ export const issueThreadInteractionContinuationPolicySchema = z.enum(
   ISSUE_THREAD_INTERACTION_CONTINUATION_POLICIES,
 );
 
+export const issueDocumentKeySchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(64)
+  .regex(/^[a-z0-9][a-z0-9_-]*$/, "Document key must be lowercase letters, numbers, _ or -");
+
 export const suggestedTaskDraftSchema = z.object({
   clientKey: z.string().trim().min(1).max(120),
   parentClientKey: z.string().trim().min(1).max(120).nullable().optional(),
@@ -308,6 +315,37 @@ export const askUserQuestionsResultSchema = z.object({
   summaryMarkdown: z.string().max(20000).nullable().optional(),
 });
 
+export const requestConfirmationIssueDocumentTargetSchema = z.object({
+  type: z.literal("issue_document"),
+  issueId: z.string().uuid().nullable().optional(),
+  documentId: z.string().uuid().nullable().optional(),
+  key: issueDocumentKeySchema,
+  revisionId: z.string().uuid(),
+  revisionNumber: z.number().int().positive().nullable().optional(),
+});
+
+export const requestConfirmationTargetSchema = z.discriminatedUnion("type", [
+  requestConfirmationIssueDocumentTargetSchema,
+]);
+
+export const requestConfirmationPayloadSchema = z.object({
+  version: z.literal(1),
+  prompt: z.string().trim().min(1).max(1000),
+  acceptLabel: z.string().trim().min(1).max(80).nullable().optional(),
+  rejectLabel: z.string().trim().min(1).max(80).nullable().optional(),
+  detailsMarkdown: z.string().max(20000).nullable().optional(),
+  supersedeOnUserComment: z.boolean().optional(),
+  target: requestConfirmationTargetSchema.nullable().optional(),
+});
+
+export const requestConfirmationResultSchema = z.object({
+  version: z.literal(1),
+  outcome: z.enum(["accepted", "rejected", "superseded_by_comment", "stale_target"]),
+  reason: z.string().trim().max(4000).nullable().optional(),
+  commentId: z.string().uuid().nullable().optional(),
+  staleTarget: requestConfirmationTargetSchema.nullable().optional(),
+});
+
 export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("suggest_tasks"),
@@ -328,6 +366,16 @@ export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
     summary: z.string().trim().max(1000).nullable().optional(),
     continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("wake_assignee"),
     payload: askUserQuestionsPayloadSchema,
+  }),
+  z.object({
+    kind: z.literal("request_confirmation"),
+    idempotencyKey: z.string().trim().max(255).nullable().optional(),
+    sourceCommentId: z.string().uuid().nullable().optional(),
+    sourceRunId: z.string().uuid().nullable().optional(),
+    title: z.string().trim().max(240).nullable().optional(),
+    summary: z.string().trim().max(1000).nullable().optional(),
+    continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("none"),
+    payload: requestConfirmationPayloadSchema,
   }),
 ]);
 
@@ -377,13 +425,6 @@ export type CreateIssueAttachmentMetadata = z.infer<typeof createIssueAttachment
 export const ISSUE_DOCUMENT_FORMATS = ["markdown"] as const;
 
 export const issueDocumentFormatSchema = z.enum(ISSUE_DOCUMENT_FORMATS);
-
-export const issueDocumentKeySchema = z
-  .string()
-  .trim()
-  .min(1)
-  .max(64)
-  .regex(/^[a-z0-9][a-z0-9_-]*$/, "Document key must be lowercase letters, numbers, _ or -");
 
 export const upsertIssueDocumentSchema = z.object({
   title: z.string().trim().max(200).nullable().optional(),

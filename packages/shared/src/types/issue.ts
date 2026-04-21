@@ -344,6 +344,35 @@ export interface AskUserQuestionsResult {
   summaryMarkdown?: string | null;
 }
 
+export interface RequestConfirmationIssueDocumentTarget {
+  type: "issue_document";
+  issueId?: string | null;
+  documentId?: string | null;
+  key: string;
+  revisionId: string;
+  revisionNumber?: number | null;
+}
+
+export type RequestConfirmationTarget = RequestConfirmationIssueDocumentTarget;
+
+export interface RequestConfirmationPayload {
+  version: 1;
+  prompt: string;
+  acceptLabel?: string | null;
+  rejectLabel?: string | null;
+  detailsMarkdown?: string | null;
+  supersedeOnUserComment?: boolean;
+  target?: RequestConfirmationTarget | null;
+}
+
+export interface RequestConfirmationResult {
+  version: 1;
+  outcome: "accepted" | "rejected" | "superseded_by_comment" | "stale_target";
+  reason?: string | null;
+  commentId?: string | null;
+  staleTarget?: RequestConfirmationTarget | null;
+}
+
 export interface IssueThreadInteractionBase extends IssueThreadInteractionActorFields {
   id: string;
   companyId: string;
@@ -373,17 +402,26 @@ export interface AskUserQuestionsInteraction extends IssueThreadInteractionBase 
   result?: AskUserQuestionsResult | null;
 }
 
+export interface RequestConfirmationInteraction extends IssueThreadInteractionBase {
+  kind: "request_confirmation";
+  payload: RequestConfirmationPayload;
+  result?: RequestConfirmationResult | null;
+}
+
 export type IssueThreadInteraction =
   | SuggestTasksInteraction
-  | AskUserQuestionsInteraction;
+  | AskUserQuestionsInteraction
+  | RequestConfirmationInteraction;
 
 export type IssueThreadInteractionPayload =
   | SuggestTasksPayload
-  | AskUserQuestionsPayload;
+  | AskUserQuestionsPayload
+  | RequestConfirmationPayload;
 
 export type IssueThreadInteractionResult =
   | SuggestTasksResult
-  | AskUserQuestionsResult;
+  | AskUserQuestionsResult
+  | RequestConfirmationResult;
 
 export interface IssueAttachment {
   id: string;

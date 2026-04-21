@@ -2,8 +2,10 @@ import { isDeepStrictEqual } from "node:util";
 import { and, asc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  documents,
   heartbeatRuns,
   issueComments,
+  issueDocuments,
   issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
@@ -13,6 +15,8 @@ import type {
   AskUserQuestionsInteraction,
   CreateIssueThreadInteraction,
   IssueThreadInteraction,
+  RequestConfirmationInteraction,
+  RequestConfirmationTarget,
   RejectIssueThreadInteraction,
   RespondIssueThreadInteraction,
   SuggestTasksInteraction,
@@ -23,6 +27,9 @@ import {
   askUserQuestionsPayloadSchema,
   askUserQuestionsResultSchema,
   createIssueThreadInteractionSchema,
+  rejectIssueThreadInteractionSchema,
+  requestConfirmationPayloadSchema,
+  requestConfirmationResultSchema,
   suggestTasksPayloadSchema,
   suggestTasksResultSchema,
 } from "@paperclipai/shared";
@@ -41,6 +48,11 @@ type CreatedIssueWakeTarget = {
   id: string;
   assigneeAgentId: string | null;
   status: string;
+};
+
+type ResolvedInteractionResult = {
+  interaction: IssueThreadInteraction;
+  createdIssues: CreatedIssueWakeTarget[];
 };
 
 type IssueThreadInteractionRow = typeof issueThreadInteractions.$inferSelect;
@@ -96,6 +108,13 @@ function hydrateInteraction(
         payload: askUserQuestionsPayloadSchema.parse(row.payload),
         result: row.result ? askUserQuestionsResultSchema.parse(row.result) : null,
       } satisfies AskUserQuestionsInteraction;
+    case "request_confirmation":
+      return {
+        ...base,
+        kind: "request_confirmation",
+        payload: requestConfirmationPayloadSchema.parse(row.payload),
+        result: row.result ? requestConfirmationResultSchema.parse(row.result) : null,
+      } satisfies RequestConfirmationInteraction;
     default:
       throw unprocessable(`Unknown interaction kind: ${row.kind}`);
   }
@@ -226,6 +245,110 @@ function normalizeQuestionAnswers(args: {
     .filter((answer): answer is AskUserQuestionsAnswer => Boolean(answer));
 }
 
+async function getIssueDocumentTargetSnapshot(db: Db | any, args: {
+  companyId: string;
+  issueId: string;
+  target: RequestConfirmationTarget;
+}) {
+  if (args.target.type !== "issue_document") {
+    throw unprocessable(`Unsupported request confirmation target: ${(args.target as { type: string }).type}`);
+  }
+  const targetIssueId = args.target.issueId ?? args.issueId;
+  const row = await db
+    .select({
+      issueId: issueDocuments.issueId,
+      documentId: issueDocuments.documentId,
+      key: issueDocuments.key,
+      latestRevisionId: documents.latestRevisionId,
+      latestRevisionNumber: documents.latestRevisionNumber,
+    })
+    .from(issueDocuments)
+    .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
+    .where(and(
+      eq(issueDocuments.companyId, args.companyId),
+      eq(issueDocuments.issueId, targetIssueId),
+      eq(issueDocuments.key, args.target.key),
+    ))
+    .then((rows: Array<{
+      issueId: string;
+      documentId: string;
+      key: string;
+      latestRevisionId: string | null;
+      latestRevisionNumber: number;
+    }>) => rows[0] ?? null);
+
+  if (!row) return null;
+  if (args.target.documentId && args.target.documentId !== row.documentId) return null;
+  return row;
+}
+
+async function assertRequestConfirmationTargetIsCurrent(db: Db | any, args: {
+  companyId: string;
+  issueId: string;
+  target?: RequestConfirmationTarget | null;
+}) {
+  if (!args.target) return;
+  const snapshot = await getIssueDocumentTargetSnapshot(db, {
+    companyId: args.companyId,
+    issueId: args.issueId,
+    target: args.target,
+  });
+  if (!snapshot || snapshot.latestRevisionId !== args.target.revisionId) {
+    throw unprocessable("request_confirmation target must reference the current issue document revision");
+  }
+  if (args.target.revisionNumber && snapshot.latestRevisionNumber !== args.target.revisionNumber) {
+    throw unprocessable("request_confirmation target revisionNumber must match the current issue document revision");
+  }
+}
+
+async function expireStaleRequestConfirmationTarget(db: Db | any, args: {
+  row: IssueThreadInteractionRow;
+  actor: InteractionActor;
+}): Promise<IssueThreadInteraction | null> {
+  if (args.row.kind !== "request_confirmation" || args.row.status !== "pending") return null;
+  const interaction = hydrateInteraction(args.row) as RequestConfirmationInteraction;
+  const target = interaction.payload.target ?? null;
+  if (!target) return null;
+
+  const snapshot = await getIssueDocumentTargetSnapshot(db, {
+    companyId: args.row.companyId,
+    issueId: args.row.issueId,
+    target,
+  });
+  const isCurrent =
+    snapshot
+    && snapshot.latestRevisionId === target.revisionId
+    && (!target.revisionNumber || snapshot.latestRevisionNumber === target.revisionNumber);
+  if (isCurrent) return null;
+
+  const now = new Date();
+  const [updated] = await db
+    .update(issueThreadInteractions)
+    .set({
+      status: "expired",
+      result: {
+        version: 1,
+        outcome: "stale_target",
+        staleTarget: target,
+      },
+      resolvedByAgentId: args.actor.agentId ?? null,
+      resolvedByUserId: args.actor.userId ?? null,
+      resolvedAt: now,
+      updatedAt: now,
+    })
+    .where(and(
+      eq(issueThreadInteractions.id, args.row.id),
+      eq(issueThreadInteractions.status, "pending"),
+    ))
+    .returning();
+
+  if (!updated) {
+    throw conflict("Interaction has already been resolved");
+  }
+  await touchIssue(db, args.row.issueId);
+  return hydrateInteraction(updated);
+}
+
 export function issueThreadInteractionService(db: Db) {
   async function getIdempotentInteraction(args: {
     issueId: string;
@@ -241,6 +364,108 @@ export function issueThreadInteractionService(db: Db) {
         eq(issueThreadInteractions.idempotencyKey, args.idempotencyKey),
       ))
       .then((rows) => rows[0] ?? null);
+  }
+
+  async function getPendingInteractionForResolution(args: {
+    issue: { id: string; companyId: string };
+    interactionId: string;
+  }) {
+    const current = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, args.interactionId))
+      .then((rows) => rows[0] ?? null);
+
+    if (!current) throw notFound("Interaction not found");
+    if (current.companyId !== args.issue.companyId || current.issueId !== args.issue.id) {
+      throw notFound("Interaction not found");
+    }
+    if (current.status !== "pending") {
+      throw conflict("Interaction has already been resolved");
+    }
+    return current;
+  }
+
+  async function acceptRequestConfirmation(args: {
+    issue: { id: string; companyId: string };
+    current: IssueThreadInteractionRow;
+    actor: InteractionActor;
+  }): Promise<IssueThreadInteraction> {
+    const expired = await expireStaleRequestConfirmationTarget(db, {
+      row: args.current,
+      actor: args.actor,
+    });
+    if (expired) {
+      return expired;
+    }
+
+    const now = new Date();
+    const [updated] = await db
+      .update(issueThreadInteractions)
+      .set({
+        status: "accepted",
+        result: {
+          version: 1,
+          outcome: "accepted",
+        },
+        resolvedByAgentId: args.actor.agentId ?? null,
+        resolvedByUserId: args.actor.userId ?? null,
+        resolvedAt: now,
+        updatedAt: now,
+      })
+      .where(and(
+        eq(issueThreadInteractions.id, args.current.id),
+        eq(issueThreadInteractions.status, "pending"),
+      ))
+      .returning();
+
+    if (!updated) {
+      throw conflict("Interaction has already been resolved");
+    }
+    await touchIssue(db, args.issue.id);
+    return hydrateInteraction(updated);
+  }
+
+  async function rejectRequestConfirmation(args: {
+    issue: { id: string; companyId: string };
+    current: IssueThreadInteractionRow;
+    input: RejectIssueThreadInteraction;
+    actor: InteractionActor;
+  }): Promise<IssueThreadInteraction> {
+    const expired = await expireStaleRequestConfirmationTarget(db, {
+      row: args.current,
+      actor: args.actor,
+    });
+    if (expired) {
+      return expired;
+    }
+
+    const now = new Date();
+    const [updated] = await db
+      .update(issueThreadInteractions)
+      .set({
+        status: "rejected",
+        result: {
+          version: 1,
+          outcome: "rejected",
+          reason: args.input.reason?.trim() || null,
+        },
+        resolvedByAgentId: args.actor.agentId ?? null,
+        resolvedByUserId: args.actor.userId ?? null,
+        resolvedAt: now,
+        updatedAt: now,
+      })
+      .where(and(
+        eq(issueThreadInteractions.id, args.current.id),
+        eq(issueThreadInteractions.status, "pending"),
+      ))
+      .returning();
+
+    if (!updated) {
+      throw conflict("Interaction has already been resolved");
+    }
+    await touchIssue(db, args.issue.id);
+    return hydrateInteraction(updated);
   }
 
   return {
@@ -314,6 +539,14 @@ export function issueThreadInteractionService(db: Db) {
         }
       }
 
+      if (data.kind === "request_confirmation") {
+        await assertRequestConfirmationTargetIsCurrent(db, {
+          companyId: issue.companyId,
+          issueId: issue.id,
+          target: data.payload.target ?? null,
+        });
+      }
+
       let created: IssueThreadInteractionRow;
       try {
         [created] = await db
@@ -354,6 +587,31 @@ export function issueThreadInteractionService(db: Db) {
 
       await touchIssue(db, issue.id);
       return hydrateInteraction(created);
+    },
+
+    acceptInteraction: async (
+      issue: { id: string; companyId: string; projectId: string | null; goalId: string | null },
+      interactionId: string,
+      input: AcceptIssueThreadInteraction,
+      actor: InteractionActor,
+    ): Promise<ResolvedInteractionResult> => {
+      const data = acceptIssueThreadInteractionSchema.parse(input);
+      const current = await getPendingInteractionForResolution({ issue, interactionId });
+      switch (current.kind) {
+        case "suggest_tasks":
+          return issueThreadInteractionService(db).acceptSuggestedTasks(issue, interactionId, data, actor);
+        case "request_confirmation":
+          return {
+            interaction: await acceptRequestConfirmation({
+              issue,
+              current,
+              actor,
+            }),
+            createdIssues: [],
+          };
+        default:
+          throw unprocessable(`Interactions of kind ${current.kind} cannot be accepted`);
+      }
     },
 
     acceptSuggestedTasks: async (
@@ -487,6 +745,29 @@ export function issueThreadInteractionService(db: Db) {
       };
     },
 
+    rejectInteraction: async (
+      issue: { id: string; companyId: string },
+      interactionId: string,
+      input: RejectIssueThreadInteraction,
+      actor: InteractionActor,
+    ) => {
+      const data = rejectIssueThreadInteractionSchema.parse(input);
+      const current = await getPendingInteractionForResolution({ issue, interactionId });
+      switch (current.kind) {
+        case "suggest_tasks":
+          return issueThreadInteractionService(db).rejectSuggestedTasks(issue, interactionId, data, actor);
+        case "request_confirmation":
+          return rejectRequestConfirmation({
+            issue,
+            current,
+            input: data,
+            actor,
+          });
+        default:
+          throw unprocessable(`Interactions of kind ${current.kind} cannot be rejected`);
+      }
+    },
+
     rejectSuggestedTasks: async (
       issue: { id: string; companyId: string },
       interactionId: string,
@@ -528,6 +809,125 @@ export function issueThreadInteractionService(db: Db) {
 
       await touchIssue(db, issue.id);
       return hydrateInteraction(updated);
+    },
+
+    expireRequestConfirmationsSupersededByComment: async (
+      issue: { id: string; companyId: string },
+      comment: { id: string; authorUserId?: string | null },
+      actor: InteractionActor,
+    ) => {
+      if (!comment.authorUserId) return [];
+
+      const rows = await db
+        .select()
+        .from(issueThreadInteractions)
+        .where(and(
+          eq(issueThreadInteractions.companyId, issue.companyId),
+          eq(issueThreadInteractions.issueId, issue.id),
+          eq(issueThreadInteractions.kind, "request_confirmation"),
+          eq(issueThreadInteractions.status, "pending"),
+        ));
+
+      const superseded = rows.filter((row) => {
+        const interaction = hydrateInteraction(row) as RequestConfirmationInteraction;
+        return interaction.payload.supersedeOnUserComment === true;
+      });
+
+      if (superseded.length === 0) return [];
+
+      const now = new Date();
+      const expired: IssueThreadInteraction[] = [];
+      for (const row of superseded) {
+        const [updated] = await db
+          .update(issueThreadInteractions)
+          .set({
+            status: "expired",
+            result: {
+              version: 1,
+              outcome: "superseded_by_comment",
+              commentId: comment.id,
+            },
+            resolvedByAgentId: actor.agentId ?? null,
+            resolvedByUserId: actor.userId ?? null,
+            resolvedAt: now,
+            updatedAt: now,
+          })
+          .where(and(
+            eq(issueThreadInteractions.id, row.id),
+            eq(issueThreadInteractions.status, "pending"),
+          ))
+          .returning();
+        if (updated) expired.push(hydrateInteraction(updated));
+      }
+
+      if (expired.length > 0) {
+        await touchIssue(db, issue.id);
+      }
+      return expired;
+    },
+
+    expireStaleRequestConfirmationsForIssueDocument: async (
+      issue: { id: string; companyId: string },
+      document: { id: string; key: string; latestRevisionId?: string | null; latestRevisionNumber?: number | null } | null,
+      actor: InteractionActor,
+    ) => {
+      const rows = await db
+        .select()
+        .from(issueThreadInteractions)
+        .where(and(
+          eq(issueThreadInteractions.companyId, issue.companyId),
+          eq(issueThreadInteractions.issueId, issue.id),
+          eq(issueThreadInteractions.kind, "request_confirmation"),
+          eq(issueThreadInteractions.status, "pending"),
+        ));
+
+      const staleRows = rows.filter((row) => {
+        const interaction = hydrateInteraction(row) as RequestConfirmationInteraction;
+        const target = interaction.payload.target;
+        if (!target || target.type !== "issue_document") return false;
+        const targetIssueId = target.issueId ?? issue.id;
+        if (targetIssueId !== issue.id) return false;
+        if (document && target.documentId && target.documentId !== document.id) return false;
+        if (document && target.key !== document.key) return false;
+        if (!document) return true;
+        return (
+          target.revisionId !== document.latestRevisionId
+          || (target.revisionNumber != null && target.revisionNumber !== document.latestRevisionNumber)
+        );
+      });
+
+      if (staleRows.length === 0) return [];
+
+      const now = new Date();
+      const expired: IssueThreadInteraction[] = [];
+      for (const row of staleRows) {
+        const target = (hydrateInteraction(row) as RequestConfirmationInteraction).payload.target ?? null;
+        const [updated] = await db
+          .update(issueThreadInteractions)
+          .set({
+            status: "expired",
+            result: {
+              version: 1,
+              outcome: "stale_target",
+              staleTarget: target,
+            },
+            resolvedByAgentId: actor.agentId ?? null,
+            resolvedByUserId: actor.userId ?? null,
+            resolvedAt: now,
+            updatedAt: now,
+          })
+          .where(and(
+            eq(issueThreadInteractions.id, row.id),
+            eq(issueThreadInteractions.status, "pending"),
+          ))
+          .returning();
+        if (updated) expired.push(hydrateInteraction(updated));
+      }
+
+      if (expired.length > 0) {
+        await touchIssue(db, issue.id);
+      }
+      return expired;
     },
 
     answerQuestions: async (

@@ -140,6 +140,7 @@ export type IssuePriority = (typeof ISSUE_PRIORITIES)[number];
 export const ISSUE_THREAD_INTERACTION_KINDS = [
   "suggest_tasks",
   "ask_user_questions",
+  "request_confirmation",
 ] as const;
 export type IssueThreadInteractionKind = (typeof ISSUE_THREAD_INTERACTION_KINDS)[number];
 

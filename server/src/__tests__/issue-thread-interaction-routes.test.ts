@@ -12,7 +12,9 @@ const mockIssueService = vi.hoisted(() => ({
 const mockInteractionService = vi.hoisted(() => ({
   listForIssue: vi.fn(),
   create: vi.fn(),
+  acceptInteraction: vi.fn(),
   acceptSuggestedTasks: vi.fn(),
+  rejectInteraction: vi.fn(),
   rejectSuggestedTasks: vi.fn(),
   answerQuestions: vi.fn(),
 }));
@@ -163,7 +165,7 @@ describe("issue thread interaction routes", () => {
       createdAt: "2026-04-20T12:00:00.000Z",
       updatedAt: "2026-04-20T12:00:00.000Z",
     });
-    mockInteractionService.acceptSuggestedTasks.mockResolvedValue({
+    mockInteractionService.acceptInteraction.mockResolvedValue({
       interaction: {
         id: "interaction-1",
         companyId: "company-1",
@@ -195,7 +197,7 @@ describe("issue thread interaction routes", () => {
         },
       ],
     });
-    mockInteractionService.rejectSuggestedTasks.mockResolvedValue({
+    mockInteractionService.rejectInteraction.mockResolvedValue({
       id: "interaction-1",
       companyId: "company-1",
       issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -290,7 +292,7 @@ describe("issue thread interaction routes", () => {
       .send({ selectedClientKeys: ["task-1"] });
 
     expect(res.status).toBe(200);
-    expect(mockInteractionService.acceptSuggestedTasks).toHaveBeenCalledWith(
+    expect(mockInteractionService.acceptInteraction).toHaveBeenCalledWith(
       expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
       "interaction-1",
       { selectedClientKeys: ["task-1"] },
@@ -356,6 +358,87 @@ describe("issue thread interaction routes", () => {
         action: "issue.thread_interaction_answered",
       }),
     );
+  });
+
+  it("accepts request confirmations and wakes the current assignee when configured", async () => {
+    mockInteractionService.acceptInteraction.mockResolvedValueOnce({
+      interaction: {
+        id: "interaction-3",
+        companyId: "company-1",
+        issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        kind: "request_confirmation",
+        status: "accepted",
+        continuationPolicy: "wake_assignee",
+        idempotencyKey: null,
+        sourceCommentId: null,
+        sourceRunId: "run-3",
+        payload: {
+          version: 1,
+          prompt: "Apply this plan?",
+        },
+        result: {
+          version: 1,
+          outcome: "accepted",
+        },
+        createdAt: "2026-04-20T12:00:00.000Z",
+        updatedAt: "2026-04-20T12:05:00.000Z",
+        resolvedAt: "2026-04-20T12:05:00.000Z",
+      },
+      createdIssues: [],
+    });
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-3/accept")
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        reason: "issue_commented",
+        payload: expect.objectContaining({
+          interactionId: "interaction-3",
+          interactionKind: "request_confirmation",
+          interactionStatus: "accepted",
+        }),
+      }),
+    );
+  });
+
+  it("does not emit a continuation wake when request confirmations are rejected", async () => {
+    mockInteractionService.rejectInteraction.mockResolvedValueOnce({
+      id: "interaction-3",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      status: "rejected",
+      continuationPolicy: "wake_assignee",
+      idempotencyKey: null,
+      sourceCommentId: null,
+      sourceRunId: "run-3",
+      payload: {
+        version: 1,
+        prompt: "Apply this plan?",
+      },
+      result: {
+        version: 1,
+        outcome: "rejected",
+        reason: "Needs changes",
+      },
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:05:00.000Z",
+      resolvedAt: "2026-04-20T12:05:00.000Z",
+    });
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-3/reject")
+      .send({ reason: "Needs changes" });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
   it("allows agent-authored interaction creation and stamps the active run id", async () => {
