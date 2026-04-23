@@ -97,6 +97,7 @@ import { agentRouteRef } from "../lib/utils";
 import {
   applyAgentSkillSnapshot,
   arraysEqual,
+  isReadOnlyRuntimeOnlySkillEntry,
   isReadOnlyUnmanagedSkillEntry,
 } from "../lib/agent-skills-state";
 
@@ -2629,9 +2630,33 @@ function AgentSkillsTab({
         })),
     [companySkillKeys, skillSnapshot],
   );
+  const runtimeOnlySkillRows = useMemo<SkillRow[]>(
+    () =>
+      (skillSnapshot?.entries ?? [])
+        .filter((entry) => isReadOnlyRuntimeOnlySkillEntry(entry, companySkillKeys))
+        .map((entry) => ({
+          id: `runtime:${entry.key}`,
+          key: entry.key,
+          name: entry.runtimeName ?? entry.key,
+          description: null,
+          detail: entry.detail ?? "Configured directly on this agent runtime.",
+          locationLabel: entry.locationLabel ?? entry.sourcePath ?? null,
+          originLabel: "Configured on this agent runtime",
+          linkTo: null,
+          readOnly: true,
+          adapterEntry: entry,
+        })),
+    [companySkillKeys, skillSnapshot],
+  );
   const desiredOnlyMissingSkills = useMemo(
-    () => skillDraft.filter((key) => !companySkillByKey.has(key)),
-    [companySkillByKey, skillDraft],
+    () =>
+      skillDraft.filter((key) => {
+        if (companySkillByKey.has(key)) return false;
+        const entry = adapterEntryByKey.get(key);
+        if (!entry) return true;
+        return !isReadOnlyRuntimeOnlySkillEntry(entry, companySkillKeys);
+      }),
+    [adapterEntryByKey, companySkillByKey, companySkillKeys, skillDraft],
   );
   const skillApplicationLabel = useMemo(() => {
     switch (skillSnapshot?.mode) {
@@ -2786,7 +2811,12 @@ function AgentSkillsTab({
               );
             };
 
-            if (optionalSkillRows.length === 0 && requiredSkillRows.length === 0 && unmanagedSkillRows.length === 0) {
+            if (
+              optionalSkillRows.length === 0
+              && requiredSkillRows.length === 0
+              && runtimeOnlySkillRows.length === 0
+              && unmanagedSkillRows.length === 0
+            ) {
               return (
                 <section className="border-y border-border">
                   <div className="px-3 py-6 text-sm text-muted-foreground">
@@ -2812,6 +2842,17 @@ function AgentSkillsTab({
                       </span>
                     </div>
                     {requiredSkillRows.map(renderSkillRow)}
+                  </section>
+                )}
+
+                {runtimeOnlySkillRows.length > 0 && (
+                  <section className="border-y border-border">
+                    <div className="border-b border-border bg-muted/40 px-3 py-2">
+                      <span className="text-xs font-medium text-muted-foreground">
+                        Runtime-only adapter skills
+                      </span>
+                    </div>
+                    {runtimeOnlySkillRows.map(renderSkillRow)}
                   </section>
                 )}
 

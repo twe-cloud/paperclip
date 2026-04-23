@@ -1093,12 +1093,18 @@ function normalizeConfiguredPaperclipRuntimeSkills(value: unknown): PaperclipSki
   return out;
 }
 
+export function readConfiguredPaperclipRuntimeSkillEntries(
+  config: Record<string, unknown>,
+): PaperclipSkillEntry[] {
+  return normalizeConfiguredPaperclipRuntimeSkills(config.paperclipRuntimeSkills);
+}
+
 export async function readPaperclipRuntimeSkillEntries(
   config: Record<string, unknown>,
   moduleDir: string,
   additionalCandidates: string[] = [],
 ): Promise<PaperclipSkillEntry[]> {
-  const configuredEntries = normalizeConfiguredPaperclipRuntimeSkills(config.paperclipRuntimeSkills);
+  const configuredEntries = readConfiguredPaperclipRuntimeSkillEntries(config);
   if (configuredEntries.length > 0) return configuredEntries;
   return listPaperclipSkillEntries(moduleDir, additionalCandidates);
 }

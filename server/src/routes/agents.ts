@@ -25,6 +25,7 @@ import {
   updateAgentSchema,
 } from "@paperclipai/shared";
 import {
+  readConfiguredPaperclipRuntimeSkillEntries,
   readPaperclipSkillSyncPreference,
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -725,16 +726,94 @@ export function agentRoutes(db: Db) {
     return LEGACY_MATERIALIZED_SKILLS_SET.has(adapterType);
   }
 
+  function mergeRuntimeSkillEntries(
+    configuredEntries: Array<{
+      key: string;
+      runtimeName: string;
+      source: string;
+      required?: boolean;
+      requiredReason?: string | null;
+    }>,
+    companyEntries: Array<{
+      key: string;
+      runtimeName: string;
+      source: string;
+      required?: boolean;
+      requiredReason?: string | null;
+    }>,
+  ) {
+    const merged = new Map<string, {
+      key: string;
+      runtimeName: string;
+      source: string;
+      required?: boolean;
+      requiredReason?: string | null;
+    }>();
+
+    for (const entry of companyEntries) {
+      merged.set(entry.key, entry);
+    }
+
+    for (const entry of configuredEntries) {
+      const existing = merged.get(entry.key);
+      if (!existing) {
+        merged.set(entry.key, entry);
+        continue;
+      }
+      merged.set(entry.key, {
+        ...existing,
+        ...entry,
+        required: existing.required || entry.required,
+        requiredReason: existing.requiredReason ?? entry.requiredReason ?? null,
+      });
+    }
+
+    return Array.from(merged.values()).sort((left, right) => left.key.localeCompare(right.key));
+  }
+
+  function resolveConfiguredRuntimeSkillReference(
+    entries: Array<{ key: string; runtimeName?: string | null }>,
+    reference: string,
+  ): string | null {
+    const normalizedReference = reference.trim().toLowerCase();
+    if (!normalizedReference) return null;
+
+    const exactKey = entries.find((entry) => entry.key.trim().toLowerCase() === normalizedReference);
+    if (exactKey) return exactKey.key;
+
+    const byRuntimeName = entries.filter((entry) =>
+      typeof entry.runtimeName === "string" && entry.runtimeName.trim().toLowerCase() === normalizedReference,
+    );
+    if (byRuntimeName.length === 1) return byRuntimeName[0]!.key;
+
+    const bySlug = entries.filter((entry) =>
+      entry.key.trim().toLowerCase().split("/").pop() === normalizedReference,
+    );
+    if (bySlug.length === 1) return bySlug[0]!.key;
+
+    return null;
+  }
+
   async function buildRuntimeSkillConfig(
     companyId: string,
     adapterType: string,
-    config: Record<string, unknown>,
+    resolvedConfig: Record<string, unknown>,
+    persistedConfig: Record<string, unknown> = resolvedConfig,
   ) {
-    const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(companyId, {
+    const baseConfig = {
+      ...persistedConfig,
+      ...resolvedConfig,
+    };
+    const companyRuntimeSkillEntries = await companySkills.listRuntimeSkillEntries(companyId, {
       materializeMissing: shouldMaterializeRuntimeSkillsForAdapter(adapterType),
     });
+    const configuredRuntimeSkillEntries = readConfiguredPaperclipRuntimeSkillEntries(baseConfig);
+    const runtimeSkillEntries = mergeRuntimeSkillEntries(
+      configuredRuntimeSkillEntries,
+      companyRuntimeSkillEntries,
+    );
     return {
-      ...config,
+      ...baseConfig,
       paperclipRuntimeSkills: runtimeSkillEntries,
     };
   }
@@ -752,18 +831,37 @@ export function agentRoutes(db: Db) {
         runtimeSkillEntries: null as Awaited<ReturnType<typeof companySkills.listRuntimeSkillEntries>> | null,
       };
     }
-
-    const resolvedRequestedSkills = await companySkills.resolveRequestedSkillKeys(
-      companyId,
-      requestedDesiredSkills,
-    );
-    const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(companyId, {
+    const configuredRuntimeSkillEntries = readConfiguredPaperclipRuntimeSkillEntries(adapterConfig);
+    const companyRuntimeSkillEntries = await companySkills.listRuntimeSkillEntries(companyId, {
       materializeMissing: shouldMaterializeRuntimeSkillsForAdapter(adapterType),
     });
+    const runtimeSkillEntries = mergeRuntimeSkillEntries(
+      configuredRuntimeSkillEntries,
+      companyRuntimeSkillEntries,
+    );
+    const companySkillKeys = new Set(companyRuntimeSkillEntries.map((entry) => entry.key));
+    const runtimeOnlyEntries = configuredRuntimeSkillEntries.filter((entry) => !companySkillKeys.has(entry.key));
+    const runtimeOnlyResolved = new Set<string>();
+    const companyRequestedReferences: string[] = [];
+
+    for (const reference of requestedDesiredSkills) {
+      const runtimeOnlyKey = resolveConfiguredRuntimeSkillReference(runtimeOnlyEntries, reference);
+      if (runtimeOnlyKey) {
+        runtimeOnlyResolved.add(runtimeOnlyKey);
+        continue;
+      }
+      companyRequestedReferences.push(reference);
+    }
+
+    const resolvedRequestedSkills = companyRequestedReferences.length > 0
+      ? await companySkills.resolveRequestedSkillKeys(companyId, companyRequestedReferences)
+      : [];
     const requiredSkills = runtimeSkillEntries
       .filter((entry) => entry.required)
       .map((entry) => entry.key);
-    const desiredSkills = Array.from(new Set([...requiredSkills, ...resolvedRequestedSkills]));
+    const desiredSkills = Array.from(
+      new Set([...requiredSkills, ...resolvedRequestedSkills, ...runtimeOnlyResolved]),
+    );
 
     return {
       adapterConfig: writePaperclipSkillSyncPreference(adapterConfig, desiredSkills),
@@ -916,9 +1014,13 @@ export function agentRoutes(db: Db) {
       const preference = readPaperclipSkillSyncPreference(
         agent.adapterConfig as Record<string, unknown>,
       );
-      const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(agent.companyId, {
+      const companyRuntimeSkillEntries = await companySkills.listRuntimeSkillEntries(agent.companyId, {
         materializeMissing: false,
       });
+      const runtimeSkillEntries = mergeRuntimeSkillEntries(
+        readConfiguredPaperclipRuntimeSkillEntries(agent.adapterConfig as Record<string, unknown>),
+        companyRuntimeSkillEntries,
+      );
       const requiredSkills = runtimeSkillEntries.filter((entry) => entry.required).map((entry) => entry.key);
       res.json(buildUnsupportedSkillSnapshot(agent.adapterType, Array.from(new Set([...requiredSkills, ...preference.desiredSkills]))));
       return;
@@ -932,6 +1034,7 @@ export function agentRoutes(db: Db) {
       agent.companyId,
       agent.adapterType,
       runtimeConfig,
+      agent.adapterConfig as Record<string, unknown>,
     );
     const snapshot = await adapter.listSkills({
       agentId: agent.id,
@@ -994,10 +1097,15 @@ export function agentRoutes(db: Db) {
         updated.companyId,
         updated.adapterConfig,
       );
-      const runtimeSkillConfig = {
-        ...runtimeConfig,
-        paperclipRuntimeSkills: runtimeSkillEntries,
-      };
+      const runtimeSkillConfig = await buildRuntimeSkillConfig(
+        updated.companyId,
+        updated.adapterType,
+        runtimeConfig,
+        {
+          ...(updated.adapterConfig as Record<string, unknown>),
+          paperclipRuntimeSkills: runtimeSkillEntries,
+        },
+      );
       const snapshot = adapter?.syncSkills
         ? await adapter.syncSkills({
             agentId: updated.id,

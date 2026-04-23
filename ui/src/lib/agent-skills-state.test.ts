@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { applyAgentSkillSnapshot, isReadOnlyUnmanagedSkillEntry } from "./agent-skills-state";
+import {
+  applyAgentSkillSnapshot,
+  isReadOnlyRuntimeOnlySkillEntry,
+  isReadOnlyUnmanagedSkillEntry,
+} from "./agent-skills-state";
 
 describe("applyAgentSkillSnapshot", () => {
   it("hydrates the initial snapshot without arming autosave", () => {
@@ -86,5 +90,27 @@ describe("applyAgentSkillSnapshot", () => {
       managed: false,
       state: "external",
     }, new Set())).toBe(true);
+  });
+
+  it("treats configured runtime-only managed skills outside the company library as read-only adapter skills", () => {
+    expect(isReadOnlyRuntimeOnlySkillEntry({
+      key: "nibiashara/local/automation-architect",
+      runtimeName: "automation-architect",
+      desired: true,
+      managed: true,
+      state: "configured",
+      origin: "company_managed",
+    }, new Set(["paperclip"]))).toBe(true);
+  });
+
+  it("does not treat missing external_unknown entries as runtime-only adapter skills", () => {
+    expect(isReadOnlyRuntimeOnlySkillEntry({
+      key: "nibiashara/local/missing-skill",
+      runtimeName: null,
+      desired: true,
+      managed: true,
+      state: "missing",
+      origin: "external_unknown",
+    }, new Set(["paperclip"]))).toBe(false);
   });
 });

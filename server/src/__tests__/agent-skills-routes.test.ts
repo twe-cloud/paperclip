@@ -302,6 +302,47 @@ describe("agent skill routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
   });
 
+  it("merges adapter-config runtime skills into the agent skills snapshot config", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent("codex_local"),
+      adapterConfig: {
+        paperclipRuntimeSkills: [
+          {
+            key: "nibiashara/local/automation-architect",
+            runtimeName: "automation-architect",
+            source: "/tmp/automation-architect",
+          },
+        ],
+        paperclipSkillSync: {
+          desiredSkills: ["nibiashara/local/automation-architect"],
+        },
+      },
+    });
+    mockAdapter.listSkills.mockResolvedValue({
+      adapterType: "codex_local",
+      supported: true,
+      mode: "ephemeral",
+      desiredSkills: ["nibiashara/local/automation-architect", "paperclipai/paperclip/paperclip"],
+      entries: [],
+      warnings: [],
+    });
+
+    const res = await request(await createApp())
+      .get("/api/agents/11111111-1111-4111-8111-111111111111/skills?companyId=company-1");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAdapter.listSkills).toHaveBeenCalledWith(
+      expect.objectContaining({
+        config: expect.objectContaining({
+          paperclipRuntimeSkills: expect.arrayContaining([
+            expect.objectContaining({ key: "paperclipai/paperclip/paperclip" }),
+            expect.objectContaining({ key: "nibiashara/local/automation-architect" }),
+          ]),
+        }),
+      }),
+    );
+  });
+
   it("keeps runtime materialization for persistent skill adapters", async () => {
     mockAgentService.getById.mockResolvedValue(makeAgent("cursor"));
     mockAdapter.listSkills.mockResolvedValue({
@@ -344,6 +385,49 @@ describe("agent skill routes", () => {
         adapterConfig: expect.objectContaining({
           paperclipSkillSync: expect.objectContaining({
             desiredSkills: ["paperclipai/paperclip/paperclip"],
+          }),
+        }),
+      }),
+      expect.any(Object),
+    );
+  });
+
+  it("preserves runtime-only adapter skills when syncing company-managed skills", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent("codex_local"),
+      adapterConfig: {
+        paperclipRuntimeSkills: [
+          {
+            key: "nibiashara/local/automation-architect",
+            runtimeName: "automation-architect",
+            source: "/tmp/automation-architect",
+          },
+        ],
+        paperclipSkillSync: {
+          desiredSkills: ["nibiashara/local/automation-architect"],
+        },
+      },
+    });
+    mockAgentService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeAgent("codex_local"),
+      adapterConfig: patch.adapterConfig ?? {},
+    }));
+
+    const res = await request(await createApp())
+      .post("/api/agents/11111111-1111-4111-8111-111111111111/skills/sync?companyId=company-1")
+      .send({ desiredSkills: ["paperclip", "automation-architect"] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockCompanySkillService.resolveRequestedSkillKeys).toHaveBeenCalledWith("company-1", ["paperclip"]);
+    expect(mockAgentService.update).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        adapterConfig: expect.objectContaining({
+          paperclipSkillSync: expect.objectContaining({
+            desiredSkills: [
+              "paperclipai/paperclip/paperclip",
+              "nibiashara/local/automation-architect",
+            ],
           }),
         }),
       }),
