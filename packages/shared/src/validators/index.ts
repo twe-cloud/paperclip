@@ -25,6 +25,15 @@ export {
   type UpdateCompanyBranding,
 } from "./company.js";
 export {
+  environmentDriverSchema,
+  environmentStatusSchema,
+  environmentLeaseStatusSchema,
+  createEnvironmentSchema,
+  updateEnvironmentSchema,
+  type CreateEnvironment,
+  type UpdateEnvironment,
+} from "./environment.js";
+export {
   companySkillSourceTypeSchema,
   companySkillTrustLevelSchema,
   companySkillCompatibilitySchema,

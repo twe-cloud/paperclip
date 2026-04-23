@@ -4,7 +4,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import type { BillingType, ExecutionWorkspace, ExecutionWorkspaceConfig } from "@paperclipai/shared";
+import type { BillingType, EnvironmentLeaseStatus, ExecutionWorkspace, ExecutionWorkspaceConfig } from "@paperclipai/shared";
 import {
   agents,
   agentRuntimeState,
@@ -43,7 +43,9 @@ import {
 } from "./workspace-runtime.js";
 import { issueService } from "./issues.js";
 import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
+import { environmentService } from "./environments.js";
 import { workspaceOperationService } from "./workspace-operations.js";
+import { logActivity } from "./activity-log.js";
 import {
   buildExecutionWorkspaceAdapterConfig,
   gateProjectExecutionWorkspacePolicy,
@@ -77,6 +79,12 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
   "opencode_local",
   "pi_local",
 ]);
+
+function leaseReleaseStatusForRunStatus(
+  status: string | null | undefined,
+): Extract<EnvironmentLeaseStatus, "released" | "expired" | "failed"> {
+  return status === "failed" || status === "timed_out" ? "failed" : "released";
+}
 
 export function applyPersistedExecutionWorkspaceConfig(input: {
   config: Record<string, unknown>;
@@ -889,6 +897,7 @@ export function heartbeatService(db: Db) {
   const companySkills = companySkillService(db);
   const issuesSvc = issueService(db);
   const executionWorkspacesSvc = executionWorkspaceService(db);
+  const environmentsSvc = environmentService(db);
   const workspaceOperationsSvc = workspaceOperationService(db);
   const activeRunExecutions = new Set<string>();
   const budgetHooks = {
@@ -2419,6 +2428,45 @@ export function heartbeatService(db: Db) {
       })(),
     };
     context.paperclipWorkspaces = resolvedWorkspace.workspaceHints;
+    const localEnvironment = await environmentsSvc.ensureLocalEnvironment(agent.companyId);
+    const environmentLease = await environmentsSvc.acquireLease({
+      companyId: agent.companyId,
+      environmentId: localEnvironment.id,
+      executionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
+      issueId: issueId ?? null,
+      heartbeatRunId: run.id,
+      leasePolicy: "ephemeral",
+      provider: "local",
+      metadata: {
+        driver: "local",
+        executionWorkspaceMode: persistedExecutionWorkspace?.mode ?? effectiveExecutionWorkspaceMode,
+        cwd: executionWorkspace.cwd,
+      },
+    });
+    context.paperclipEnvironment = {
+      id: localEnvironment.id,
+      name: localEnvironment.name,
+      driver: localEnvironment.driver,
+      leaseId: environmentLease.id,
+    };
+    await logActivity(db, {
+      companyId: agent.companyId,
+      actorType: "agent",
+      actorId: agent.id,
+      agentId: agent.id,
+      runId: run.id,
+      action: "environment.lease_acquired",
+      entityType: "environment_lease",
+      entityId: environmentLease.id,
+      details: {
+        environmentId: localEnvironment.id,
+        driver: localEnvironment.driver,
+        leasePolicy: environmentLease.leasePolicy,
+        provider: environmentLease.provider,
+        executionWorkspaceId: environmentLease.executionWorkspaceId,
+        issueId,
+      },
+    });
     const runtimeServiceIntents = (() => {
       const runtimeConfig = parseObject(resolvedConfig.workspaceRuntime);
       return Array.isArray(runtimeConfig.services)
@@ -2435,6 +2483,13 @@ export function heartbeatService(db: Db) {
     if (executionWorkspace.projectId && !readNonEmptyString(context.projectId)) {
       context.projectId = executionWorkspace.projectId;
     }
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: context,
+        updatedAt: new Date(),
+      })
+      .where(eq(heartbeatRuns.id, run.id));
     const runtimeSessionFallback = taskKey || resetTaskSession ? null : runtime.sessionId;
     let previousSessionDisplayId = truncateDisplayId(
       explicitResumeSessionDisplayId ??
@@ -2952,6 +3007,34 @@ export function heartbeatService(db: Db) {
           // DB calls threw (e.g. a transient DB error in finalizeAgentStatus).
           await finalizeAgentStatus(run.agentId, "failed").catch(() => undefined);
         } finally {
+          const latestRun = await getRun(run.id).catch(() => null);
+          const releasedLeases = await environmentsSvc
+            .releaseLeasesForRun(run.id, leaseReleaseStatusForRunStatus(latestRun?.status))
+            .catch((err) => {
+              logger.warn({ err, runId: run.id }, "failed to release environment leases for heartbeat run");
+              return [];
+            });
+          for (const lease of releasedLeases) {
+            await logActivity(db, {
+              companyId: run.companyId,
+              actorType: "agent",
+              actorId: run.agentId,
+              agentId: run.agentId,
+              runId: run.id,
+              action: "environment.lease_released",
+              entityType: "environment_lease",
+              entityId: lease.id,
+              details: {
+                environmentId: lease.environmentId,
+                driver: lease.metadata?.driver ?? "local",
+                leasePolicy: lease.leasePolicy,
+                provider: lease.provider,
+                executionWorkspaceId: lease.executionWorkspaceId,
+                issueId: lease.issueId,
+                status: lease.status,
+              },
+            }).catch(() => undefined);
+          }
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
           activeRunExecutions.delete(run.id);
           await startNextQueuedRunForAgent(run.agentId);

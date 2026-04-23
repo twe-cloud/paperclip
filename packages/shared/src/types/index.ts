@@ -1,5 +1,6 @@
 export type { Company } from "./company.js";
 export type { InstanceExperimentalSettings, InstanceGeneralSettings, InstanceSettings } from "./instance.js";
+export type { Environment, EnvironmentLease, LocalEnvironmentConfig } from "./environment.js";
 export type {
   CompanySkillSourceType,
   CompanySkillTrustLevel,
